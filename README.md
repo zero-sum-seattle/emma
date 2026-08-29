@@ -1,5 +1,7 @@
 # Emma
 
+<img src="assets/emma-mascot.png" alt="Emma mascot" width="240">
+
 Emma is a small Ubuntu terminal helper backed by the persistent Codex app-server.
 It connects to Codex's managed Unix socket, asks a concise question using
 `gpt-5.6-luna`, streams the answer, and exits while the app-server stays running.
