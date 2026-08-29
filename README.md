@@ -35,12 +35,23 @@ install -Dm755 emma ~/.local/bin/emma
 emma how do I see disk usage
 emma what does chmod 755 mean
 emma --timing how do I list failed systemd services
+git log | emma what changed here
+emma -- --this-looks-like-a-flag-but-isnt
+emma --help
+emma --version
 ```
 
 Emma defaults to Luna with low reasoning. It starts Codex's managed daemon
 automatically when the socket is unavailable. Every question gets a fresh,
 ephemeral, read-only thread with approvals disabled and instructions not to run
 tools or access external services.
+
+The question can come from argv, from piped stdin, or both. If stdin is piped
+(a pipe or a redirected file — not just any non-terminal stdin) and argv is
+also given, the piped input is appended to the argv question as clearly
+delimited context, so `git log | emma what changed here` works as expected.
+Use `--` to stop option parsing so a question can start with a dash. `--help`
+and `--version` are handled directly and never touch the network or socket.
 
 ### Daemon lifecycle
 
@@ -58,11 +69,21 @@ the daemon starts.
 Environment variables provide lightweight overrides:
 
 - `EMMA_MODEL` — model name; defaults to `gpt-5.6-luna`
-- `EMMA_TIMEOUT` — response timeout in seconds; defaults to `120`
+- `EMMA_TIMEOUT` (alias `EMMA_IDLE_TIMEOUT`) — **idle** timeout in seconds:
+  how long a single read from the app-server may block before giving up.
+  It is not a cap on the whole response — a turn that keeps emitting tokens,
+  even slowly, never trips it. Defaults to `120`.
+- `EMMA_TURN_TIMEOUT` — wall-clock deadline in seconds for an entire turn,
+  from `turn/start` to completion. This is the setting that bounds total
+  response time. Defaults to `300`.
 - `EMMA_CWD` — thread working directory; defaults to `/tmp`
 - `EMMA_CODEX` — path to the Codex executable
 - `EMMA_SOCKET` — path to the managed app-server Unix socket
 - `EMMA_DEBUG` — print raw app-server messages when set
+
+An invalid (non-numeric) value for any of the timeout variables prints a
+clean `emma: invalid EMMA_...=...` error and exits 2 instead of a Python
+traceback.
 
 ## How it works
 
@@ -74,6 +95,17 @@ Environment variables provide lightweight overrides:
 
 There is no custom daemon, systemd service, API key, or third-party Python
 dependency.
+
+`--timing` prints cumulative phase timestamps to stderr, so a slow response
+can be attributed to a specific phase instead of only a single opaque total:
+
+```
+emma timing: connect=0.021s initialize=0.045s thread_start=0.061s turn_start=0.078s first_output=1.203s total=4.091s
+```
+
+Each value is seconds since the start of the call, in the order the phases
+complete: socket connect, the `initialize` handshake, `thread/start`,
+`turn/start`, first streamed output, and the overall total.
 
 ## Benchmark snapshot
 
@@ -90,3 +122,7 @@ Model and network latency remain the largest part of the total response time.
 Emma's output can still be incorrect. Read unfamiliar commands before running
 them, especially commands using `sudo`, deletion, disks, permissions, or package
 management.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

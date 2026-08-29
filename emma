@@ -417,6 +417,39 @@ def _connect_with_retry(socket_path: Path) -> AppServerConnection:
     ) from last_exc
 
 
+# Newest Codex CLI release the app-server protocol was verified against
+# (see README). The initialize response's exact shape for reporting a
+# server version isn't confirmed locally — Codex isn't installed in this
+# environment — so this checks the couple of plausible locations
+# defensively and skips silently if neither is present.
+SUPPORTED_CODEX_VERSION = (0, 150)
+
+
+def _warn_if_codex_newer(initialize_result: dict[str, Any]) -> None:
+    version_str: Any = None
+    server_info = initialize_result.get("serverInfo")
+    if isinstance(server_info, dict):
+        version_str = server_info.get("version")
+    if not isinstance(version_str, str):
+        version_str = initialize_result.get("version")
+    if not isinstance(version_str, str):
+        return
+
+    parts = version_str.split(".")
+    try:
+        version = (int(parts[0]), int(parts[1]))
+    except (IndexError, ValueError):
+        return
+
+    if version > SUPPORTED_CODEX_VERSION:
+        supported = ".".join(str(part) for part in SUPPORTED_CODEX_VERSION)
+        print(
+            f"emma: Codex {version_str} is newer than emma expects "
+            f"(tested against {supported}.x); protocol may have changed",
+            file=sys.stderr,
+        )
+
+
 def ask(prompt: str, *, timing: bool) -> None:
     started = time.monotonic()
     # Cumulative phase timestamps for --timing, in the order they're
@@ -430,8 +463,9 @@ def ask(prompt: str, *, timing: bool) -> None:
         turn_id: str | None = None
         wrote_output = False
         try:
-            server.initialize()
+            initialize_result = server.initialize()
             timings["initialize"] = time.monotonic() - started
+            _warn_if_codex_newer(initialize_result)
 
             thread_result = server.request(
                 "thread/start",

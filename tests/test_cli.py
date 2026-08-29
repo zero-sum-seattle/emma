@@ -122,6 +122,32 @@ class VersionConsistencyTest(unittest.TestCase):
         self.assertIn('"version": VERSION', source)
 
 
+class CodexVersionWarningTest(unittest.TestCase):
+    def _warning(self, initialize_result):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            emma._warn_if_codex_newer(initialize_result)
+        return buf.getvalue()
+
+    def test_newer_server_version_warns(self):
+        newer = f"{emma.SUPPORTED_CODEX_VERSION[0]}.{emma.SUPPORTED_CODEX_VERSION[1] + 1}.0"
+        output = self._warning({"serverInfo": {"version": newer}})
+        self.assertIn("newer than emma expects", output)
+        self.assertIn(newer, output)
+
+    def test_matching_server_version_is_silent(self):
+        matching = f"{emma.SUPPORTED_CODEX_VERSION[0]}.{emma.SUPPORTED_CODEX_VERSION[1]}.3"
+        output = self._warning({"serverInfo": {"version": matching}})
+        self.assertEqual(output, "")
+
+    def test_missing_version_is_silent(self):
+        self.assertEqual(self._warning({}), "")
+        self.assertEqual(self._warning({"capabilities": {}}), "")
+
+
 class EnvValidationTest(unittest.TestCase):
     def _run_emma(self, env_overrides, argv):
         env = dict(os.environ)
