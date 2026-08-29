@@ -3,15 +3,15 @@
 
 from __future__ import annotations
 
-import json
-import os
 import base64
 import hashlib
+import json
+import os
 import socket
 import struct
 import sys
 import time
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -28,7 +28,7 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         print(f"emma: invalid {name}={raw!r}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from None
 
 
 def _idle_timeout_seconds() -> float:
@@ -328,7 +328,7 @@ class AppServerConnection:
                 pass
             self._socket.close()
 
-    def __enter__(self) -> "AppServerConnection":
+    def __enter__(self) -> AppServerConnection:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -365,8 +365,7 @@ def start_daemon(codex: str) -> None:
     try:
         result = subprocess.run(
             [codex, "app-server", "daemon", "start"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=20,
             check=False,

@@ -1,0 +1,15 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# UP041: socket.timeout stays as-is in the WebSocket framing layer, which
+# is intentionally left untouched outside the specific fixes it needed.
+ignore = ["UP041"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["emma", "tests"]
+warn_unused_ignores = true
+warn_redundant_casts = true
