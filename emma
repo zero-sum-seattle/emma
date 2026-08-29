@@ -7,14 +7,14 @@ import json
 import os
 import base64
 import hashlib
-import shutil
 import socket
 import struct
-import subprocess
 import sys
 import time
-from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 VERSION = "0.1.0"
@@ -75,7 +75,19 @@ class AppServerConnection:
         try:
             self._socket.connect(str(socket_path))
             self._upgrade_to_websocket()
-            self.request(
+        except Exception:
+            self.close()
+            raise
+
+    def initialize(self) -> dict[str, Any]:
+        """Send the app-server `initialize`/`initialized` handshake.
+
+        Split out from __init__ (rather than transport connect + upgrade
+        only) so --timing can attribute this JSON-RPC round trip
+        separately from the raw socket connect and WebSocket upgrade.
+        """
+        try:
+            result = self.request(
                 "initialize",
                 {
                     "clientInfo": {
@@ -86,6 +98,7 @@ class AppServerConnection:
                 },
             )
             self.send({"method": "initialized", "params": {}})
+            return result
         except Exception:
             self.close()
             raise
@@ -323,9 +336,13 @@ class AppServerConnection:
 
 
 def find_codex() -> str:
+    from pathlib import Path
+
     override = os.environ.get("EMMA_CODEX")
     if override:
         return str(Path(override).expanduser())
+    import shutil
+
     codex = shutil.which("codex")
     if not codex:
         raise EmmaError("cannot find `codex` on PATH")
@@ -333,6 +350,8 @@ def find_codex() -> str:
 
 
 def find_socket() -> Path:
+    from pathlib import Path
+
     override = os.environ.get("EMMA_SOCKET")
     if override:
         return Path(override).expanduser()
@@ -341,6 +360,8 @@ def find_socket() -> Path:
 
 
 def start_daemon(codex: str) -> None:
+    import subprocess
+
     try:
         result = subprocess.run(
             [codex, "app-server", "daemon", "start"],
@@ -399,14 +420,20 @@ def _connect_with_retry(socket_path: Path) -> AppServerConnection:
 
 def ask(prompt: str, *, timing: bool) -> None:
     started = time.monotonic()
-    first_output_at: float | None = None
+    # Cumulative phase timestamps for --timing, in the order they're
+    # expected to complete: connect, initialize, thread_start, turn_start,
+    # first_output, total. Each value is seconds since `started`.
+    timings: dict[str, float] = {}
 
     with connect() as server:
-        connected_at = time.monotonic()
+        timings["connect"] = time.monotonic() - started
         thread_id: str | None = None
         turn_id: str | None = None
         wrote_output = False
         try:
+            server.initialize()
+            timings["initialize"] = time.monotonic() - started
+
             thread_result = server.request(
                 "thread/start",
                 {
@@ -434,6 +461,7 @@ def ask(prompt: str, *, timing: bool) -> None:
             thread_id = thread.get("id") if isinstance(thread, dict) else None
             if not isinstance(thread_id, str):
                 raise EmmaError("thread/start returned no thread id")
+            timings["thread_start"] = time.monotonic() - started
 
             turn_result = server.request(
                 "turn/start",
@@ -446,6 +474,7 @@ def ask(prompt: str, *, timing: bool) -> None:
             )
             turn = turn_result.get("turn", {})
             turn_id = turn.get("id") if isinstance(turn, dict) else None
+            timings["turn_start"] = time.monotonic() - started
             streamed_items: set[str] = set()
             # Wall-clock deadline for the whole turn, separate from the
             # per-recv idle timeout: a turn that keeps emitting tokens
@@ -482,8 +511,7 @@ def ask(prompt: str, *, timing: bool) -> None:
                     delta = params.get("delta")
                     item_id = params.get("itemId")
                     if isinstance(delta, str) and delta:
-                        if first_output_at is None:
-                            first_output_at = time.monotonic()
+                        timings.setdefault("first_output", time.monotonic() - started)
                         sys.stdout.write(delta)
                         sys.stdout.flush()
                         wrote_output = True
@@ -497,8 +525,7 @@ def ask(prompt: str, *, timing: bool) -> None:
                     item_id = item.get("id")
                     text = item.get("text")
                     if item_id not in streamed_items and isinstance(text, str) and text:
-                        if first_output_at is None:
-                            first_output_at = time.monotonic()
+                        timings.setdefault("first_output", time.monotonic() - started)
                         sys.stdout.write(text)
                         sys.stdout.flush()
                         wrote_output = True
@@ -542,15 +569,11 @@ def ask(prompt: str, *, timing: bool) -> None:
                 sys.stdout.flush()
 
     finished = time.monotonic()
+    timings.setdefault("first_output", finished - started)
+    timings["total"] = finished - started
     if timing:
-        first = first_output_at or finished
-        print(
-            "emma timing: "
-            f"connect={connected_at - started:.3f}s "
-            f"first_output={first - started:.3f}s "
-            f"total={finished - started:.3f}s",
-            file=sys.stderr,
-        )
+        parts = " ".join(f"{name}={value:.3f}s" for name, value in timings.items())
+        print(f"emma timing: {parts}", file=sys.stderr)
 
 
 USAGE = "Usage: emma [--timing] [--] <question>"
