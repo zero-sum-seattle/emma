@@ -44,6 +44,16 @@ def happy_path_script(conn) -> None:
     base_params = {"threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1"}
     conn.send(
         {
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            },
+        }
+    )
+    conn.send(
+        {
             "method": "item/agentMessage/delta",
             "params": {**base_params, "delta": "Use "},
         }

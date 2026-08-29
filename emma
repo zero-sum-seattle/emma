@@ -581,6 +581,11 @@ def ask(prompt: str, *, timing: bool) -> None:
                 elif method == "thread/error":
                     raise EmmaError(f"Codex thread error: {params.get('error')}")
 
+                elif method == "turn/started":
+                    # Non-terminal: emitted right after turn/start as the
+                    # turn begins. Not a signal to stop reading events.
+                    continue
+
                 elif isinstance(method, str) and method.startswith("turn/"):
                     # Any other turn/* method is a terminal state this file
                     # doesn't know the name of yet; end the turn rather than
