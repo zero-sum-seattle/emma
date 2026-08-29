@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Minimal terminal helper backed by Codex's persistent app-server daemon."""
+
+from __future__ import annotations
+
+import json
+import os
+import base64
+import hashlib
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+MODEL = os.environ.get("EMMA_MODEL", "gpt-5.6-luna")
+TIMEOUT_SECONDS = float(os.environ.get("EMMA_TIMEOUT", "120"))
+WORKING_DIRECTORY = os.environ.get("EMMA_CWD", "/tmp")
+DEVELOPER_INSTRUCTIONS = """\
+You are Emma, a fast terminal reference assistant for Ubuntu and Unix-like systems.
+Answer the user's question directly and concisely. Prefer an exact command followed
+by at most a short explanation. Use plain terminal text without Markdown code
+fences or decorative formatting. Do not inspect files, run commands, call tools,
+or access external services. If the answer depends on missing details, state the
+assumption briefly.
+"""
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class EmmaError(RuntimeError):
+    pass
+
+
+class AppServerConnection:
+    def __init__(self, socket_path: Path) -> None:
+        self._next_id = 1
+        self._pending: list[dict[str, Any]] = []
+        self._incoming = bytearray()
+        self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._socket.settimeout(TIMEOUT_SECONDS)
+
+        try:
+            self._socket.connect(str(socket_path))
+            self._upgrade_to_websocket()
+            self.request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "emma",
+                        "title": "Emma Terminal Assistant",
+                        "version": "0.1.0",
+                    }
+                },
+            )
+            self.send({"method": "initialized", "params": {}})
+        except Exception:
+            self.close()
+            raise
+
+    def _upgrade_to_websocket(self) -> None:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET / HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        self._socket.sendall(request.encode("ascii"))
+
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = self._socket.recv(4096)
+            if not chunk:
+                raise EmmaError("Codex closed the socket during WebSocket upgrade")
+            response.extend(chunk)
+            if len(response) > 65536:
+                raise EmmaError("Codex returned an oversized WebSocket handshake")
+
+        raw_headers, _, remainder = response.partition(b"\r\n\r\n")
+        self._incoming.extend(remainder)
+        lines = raw_headers.decode("latin-1").split("\r\n")
+        if not lines or " 101 " not in f" {lines[0]} ":
+            raise EmmaError(f"WebSocket upgrade failed: {lines[0] if lines else ''}")
+
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(
+            hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        if headers.get("sec-websocket-accept") != expected:
+            raise EmmaError("Codex returned an invalid WebSocket handshake")
+
+    def _send_frame(self, opcode: int, payload: bytes = b"") -> None:
+        first = 0x80 | opcode
+        length = len(payload)
+        if length < 126:
+            header = struct.pack("!BB", first, 0x80 | length)
+        elif length <= 0xFFFF:
+            header = struct.pack("!BBH", first, 0x80 | 126, length)
+        else:
+            header = struct.pack("!BBQ", first, 0x80 | 127, length)
+
+        mask = os.urandom(4)
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self._socket.sendall(header + mask + masked)
+
+    def _read_exact(self, size: int) -> bytes:
+        while len(self._incoming) < size:
+            try:
+                chunk = self._socket.recv(max(4096, size - len(self._incoming)))
+            except socket.timeout as exc:
+                raise EmmaError(
+                    f"Codex did not respond within {TIMEOUT_SECONDS:g} seconds"
+                ) from exc
+            if not chunk:
+                raise EmmaError("Codex app-server closed the connection")
+            self._incoming.extend(chunk)
+
+        result = bytes(self._incoming[:size])
+        del self._incoming[:size]
+        return result
+
+    def _read_text_frame(self) -> str:
+        fragments = bytearray()
+        fragmented = False
+
+        while True:
+            first, second = self._read_exact(2)
+            finished = bool(first & 0x80)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._read_exact(8))[0]
+
+            mask = self._read_exact(4) if masked else b""
+            payload = self._read_exact(length)
+            if masked:
+                payload = bytes(
+                    byte ^ mask[index % 4] for index, byte in enumerate(payload)
+                )
+
+            if opcode == 0x8:
+                raise EmmaError("Codex app-server closed the WebSocket")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode == 0x1:
+                fragments = bytearray(payload)
+                fragmented = not finished
+            elif opcode == 0x0 and fragmented:
+                fragments.extend(payload)
+                fragmented = not finished
+            else:
+                continue
+
+            if finished:
+                return fragments.decode("utf-8")
+
+    def send(self, message: dict[str, Any]) -> None:
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        self._send_frame(0x1, payload)
+
+    def read_message(self) -> dict[str, Any]:
+        try:
+            message = json.loads(self._read_text_frame())
+        except json.JSONDecodeError as exc:
+            raise EmmaError(f"Codex returned invalid protocol data: {exc}") from exc
+
+        if os.environ.get("EMMA_DEBUG"):
+            print(json.dumps(message, indent=2), file=sys.stderr)
+        return message
+
+    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_id = self._next_id
+        self._next_id += 1
+        self.send({"method": method, "id": request_id, "params": params})
+
+        while True:
+            message = self.read_message()
+            if message.get("id") != request_id:
+                self._pending.append(message)
+                continue
+
+            if "error" in message:
+                error = message["error"]
+                if isinstance(error, dict):
+                    detail = error.get("message") or json.dumps(error)
+                else:
+                    detail = str(error)
+                raise EmmaError(f"{method} failed: {detail}")
+
+            result = message.get("result")
+            return result if isinstance(result, dict) else {}
+
+    def next_event(self) -> dict[str, Any]:
+        if self._pending:
+            return self._pending.pop(0)
+        return self.read_message()
+
+    def close(self) -> None:
+        if getattr(self, "_socket", None) is not None:
+            try:
+                self._send_frame(0x8)
+            except OSError:
+                pass
+            self._socket.close()
+
+    def __enter__(self) -> "AppServerConnection":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def find_codex() -> str:
+    override = os.environ.get("EMMA_CODEX")
+    if override:
+        return str(Path(override).expanduser())
+    codex = shutil.which("codex")
+    if not codex:
+        raise EmmaError("cannot find `codex` on PATH")
+    return codex
+
+
+def find_socket() -> Path:
+    override = os.environ.get("EMMA_SOCKET")
+    if override:
+        return Path(override).expanduser()
+    codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    return codex_home / "app-server-control" / "app-server-control.sock"
+
+
+def start_daemon(codex: str) -> None:
+    try:
+        result = subprocess.run(
+            [codex, "app-server", "daemon", "start"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise EmmaError("timed out starting the Codex app-server daemon") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise EmmaError(f"could not start the Codex app-server daemon: {detail}")
+
+
+def connect(codex: str) -> AppServerConnection:
+    socket_path = find_socket()
+    try:
+        return AppServerConnection(socket_path)
+    except (EmmaError, OSError):
+        start_daemon(codex)
+        return AppServerConnection(socket_path)
+
+
+def ask(prompt: str, *, timing: bool) -> None:
+    started = time.monotonic()
+    first_output_at: float | None = None
+    codex = find_codex()
+
+    with connect(codex) as server:
+        connected_at = time.monotonic()
+        thread_result = server.request(
+            "thread/start",
+            {
+                "model": MODEL,
+                "cwd": WORKING_DIRECTORY,
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "ephemeral": True,
+                "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                "config": {
+                    "model_reasoning_effort": "low",
+                    "model_verbosity": "low",
+                },
+            },
+        )
+        thread = thread_result.get("thread", {})
+        thread_id = thread.get("id") if isinstance(thread, dict) else None
+        if not isinstance(thread_id, str):
+            raise EmmaError("thread/start returned no thread id")
+
+        turn_result = server.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "effort": "low",
+                "input": [{"type": "text", "text": prompt}],
+            },
+        )
+        turn = turn_result.get("turn", {})
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+        streamed_items: set[str] = set()
+        wrote_output = False
+
+        while True:
+            event = server.next_event()
+            method = event.get("method")
+            params = event.get("params", {})
+            if not isinstance(params, dict):
+                continue
+
+            event_thread_id = params.get("threadId")
+            event_turn_id = params.get("turnId")
+            if event_thread_id not in (None, thread_id):
+                continue
+            if turn_id and event_turn_id not in (None, turn_id):
+                continue
+
+            if method == "item/agentMessage/delta":
+                delta = params.get("delta")
+                item_id = params.get("itemId")
+                if isinstance(delta, str) and delta:
+                    if first_output_at is None:
+                        first_output_at = time.monotonic()
+                    sys.stdout.write(delta)
+                    sys.stdout.flush()
+                    wrote_output = True
+                if isinstance(item_id, str):
+                    streamed_items.add(item_id)
+
+            elif method == "item/completed":
+                item = params.get("item", {})
+                if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                    continue
+                item_id = item.get("id")
+                text = item.get("text")
+                if item_id not in streamed_items and isinstance(text, str) and text:
+                    if first_output_at is None:
+                        first_output_at = time.monotonic()
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+                    wrote_output = True
+
+            elif method == "turn/completed":
+                completed_turn = params.get("turn", {})
+                if isinstance(completed_turn, dict):
+                    status = completed_turn.get("status")
+                    if status == "failed":
+                        error = completed_turn.get("error")
+                        raise EmmaError(f"Codex turn failed: {error}")
+                break
+
+        if wrote_output:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+    finished = time.monotonic()
+    if timing:
+        first = first_output_at or finished
+        print(
+            "emma timing: "
+            f"connect={connected_at - started:.3f}s "
+            f"first_output={first - started:.3f}s "
+            f"total={finished - started:.3f}s",
+            file=sys.stderr,
+        )
+
+
+def main(argv: list[str]) -> int:
+    timing = bool(argv and argv[0] == "--timing")
+    if timing:
+        argv = argv[1:]
+
+    if argv:
+        prompt = " ".join(argv).strip()
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    else:
+        print("Usage: emma [--timing] <question>", file=sys.stderr)
+        return 2
+
+    if not prompt:
+        print("emma: question cannot be empty", file=sys.stderr)
+        return 2
+
+    try:
+        ask(prompt, timing=timing)
+        return 0
+    except KeyboardInterrupt:
+        print("\nemma: interrupted", file=sys.stderr)
+        return 130
+    except EmmaError as exc:
+        print(f"emma: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
