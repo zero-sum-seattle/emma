@@ -621,6 +621,26 @@ def parse_args(argv: list[str]) -> tuple[str, list[str], bool]:
     return "run", question_parts, timing
 
 
+def _stdin_is_piped() -> bool:
+    """True only for stdin actually redirected from a pipe or a file.
+
+    isatty() alone isn't enough: a non-tty stdin that's neither a pipe nor
+    a regular file (a character device, a socket, ...) has no EOF coming,
+    so reading it would block forever. That's a real invocation shape, not
+    just a test artifact — a plain `emma <question>` run from inside
+    another long-lived process can inherit exactly this kind of stdin.
+    """
+    if sys.stdin.isatty():
+        return False
+    import stat
+
+    try:
+        mode = os.fstat(sys.stdin.fileno()).st_mode
+    except OSError:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISREG(mode)
+
+
 def main(argv: list[str]) -> int:
     action, question_parts, timing = parse_args(argv)
     if action == "help":
@@ -630,7 +650,7 @@ def main(argv: list[str]) -> int:
         print(VERSION)
         return 0
 
-    have_stdin = not sys.stdin.isatty()
+    have_stdin = _stdin_is_piped()
     if not question_parts and not have_stdin:
         print(USAGE, file=sys.stderr)
         return 2
