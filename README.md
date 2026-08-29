@@ -57,6 +57,55 @@ delimited context, so `git log | emma what changed here` works as expected.
 Use `--` to stop option parsing so a question can start with a dash. `--help`
 and `--version` are handled directly and never touch the network or socket.
 
+### Personalization
+
+Emma automatically picks up persistent, personal instructions from:
+
+```
+~/.config/emma/EMMA.md
+```
+
+If that file exists, its contents are sent with every question as
+standing instructions — separate from the question itself, and separate
+from Codex's own `AGENTS.md` handling (Emma never reads or parses
+`AGENTS.md`; that stays entirely Codex's responsibility). If the file
+doesn't exist, Emma runs exactly as before — nothing is required.
+
+Example `~/.config/emma/EMMA.md`:
+
+```markdown
+# Emma Instructions
+Keep answers concise.
+Assume I use Ubuntu and bash unless told otherwise.
+For shell commands:
+- explain destructive operations
+- prefer simple solutions
+For programming:
+- favor maintainable code over unnecessary abstractions
+- explain important architectural tradeoffs
+- challenge questionable assumptions
+```
+
+Two flags adjust this per invocation:
+
+```bash
+emma "why is this systemd service failing?"
+emma --instructions ./instructions.md "review this code"
+emma --no-user-instructions "why is this systemd service failing?"
+```
+
+- `--instructions <file>` adds an extra, more specific instructions file
+  on top of `~/.config/emma/EMMA.md` for just that call.
+- `--no-user-instructions` skips `~/.config/emma/EMMA.md` for that call
+  (an explicitly passed `--instructions` file is still used).
+
+From least to most specific, instructions layer as: Codex/system-level
+instructions, Codex's own `AGENTS.md` handling, `~/.config/emma/EMMA.md`,
+then `--instructions <file>`, with the question itself always last. A
+missing `~/.config/emma/EMMA.md` is silent and normal; a missing or
+unreadable file passed to `--instructions` is a clean error that exits
+non-zero before anything is sent to Codex.
+
 ### Daemon lifecycle
 
 You do not need to start the daemon yourself. On every invocation, Emma first
@@ -83,6 +132,8 @@ Environment variables provide lightweight overrides:
 - `EMMA_CWD` — thread working directory; defaults to `/tmp`
 - `EMMA_CODEX` — path to the Codex executable
 - `EMMA_SOCKET` — path to the managed app-server Unix socket
+- `EMMA_USER_INSTRUCTIONS` — overrides the default personal instructions
+  file path; defaults to `~/.config/emma/EMMA.md` (see Personalization)
 - `EMMA_DEBUG` — print raw app-server messages when set
 
 An invalid (non-numeric) value for any of the timeout variables prints a
@@ -94,6 +145,11 @@ traceback.
 1. Connect to `~/.codex/app-server-control/app-server-control.sock`.
 2. Perform a WebSocket upgrade over the Unix socket.
 3. Send `initialize`, `thread/start`, and `turn/start` app-server messages.
+   `thread/start`'s `developerInstructions` carries Emma's own base
+   instructions plus, when present, `~/.config/emma/EMMA.md` and/or
+   `--instructions <file>` — that's the protocol's own layer for
+   persistent, out-of-band guidance, so the question sent in `turn/start`
+   stays exactly what was typed.
 4. Stream `item/agentMessage/delta` events to the terminal.
 5. Close the client connection while leaving Codex's daemon running.
 
