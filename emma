@@ -17,16 +17,30 @@ from pathlib import Path
 from typing import Any
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"emma: invalid {name}={raw!r}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _idle_timeout_seconds() -> float:
+    name = "EMMA_IDLE_TIMEOUT" if "EMMA_IDLE_TIMEOUT" in os.environ else "EMMA_TIMEOUT"
+    return _env_float(name, 120.0)
+
+
 MODEL = os.environ.get("EMMA_MODEL", "gpt-5.6-luna")
 # EMMA_TIMEOUT (aliased as EMMA_IDLE_TIMEOUT) is a per-recv *idle* timeout:
 # how long a single socket read may block before giving up. It is not a cap
 # on the whole response, so a turn that keeps emitting tokens, even slowly,
 # never trips it. EMMA_TURN_TIMEOUT is the separate wall-clock deadline for
 # an entire turn, from turn/start to completion.
-IDLE_TIMEOUT_SECONDS = float(
-    os.environ.get("EMMA_IDLE_TIMEOUT", os.environ.get("EMMA_TIMEOUT", "120"))
-)
-TURN_TIMEOUT_SECONDS = float(os.environ.get("EMMA_TURN_TIMEOUT", "300"))
+IDLE_TIMEOUT_SECONDS = _idle_timeout_seconds()
+TURN_TIMEOUT_SECONDS = _env_float("EMMA_TURN_TIMEOUT", 300.0)
 WORKING_DIRECTORY = os.environ.get("EMMA_CWD", "/tmp")
 DEVELOPER_INSTRUCTIONS = """\
 You are Emma, a fast terminal reference assistant for Ubuntu and Unix-like systems.
@@ -37,6 +51,10 @@ or access external services. If the answer depends on missing details, state the
 assumption briefly.
 """
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# The socket is a trusted local peer, but a corrupt or malicious length
+# header (the 127-length marker allows up to 2^64) shouldn't make
+# _read_exact loop allocating memory forever.
+MAX_FRAME_BYTES = 32 * 1024 * 1024
 
 
 class EmmaError(RuntimeError):
@@ -153,6 +171,11 @@ class AppServerConnection:
             elif length == 127:
                 length = struct.unpack("!Q", self._read_exact(8))[0]
 
+            if length > MAX_FRAME_BYTES:
+                raise EmmaError(
+                    f"Codex sent an oversized WebSocket frame ({length} bytes)"
+                )
+
             mask = self._read_exact(4) if masked else b""
             payload = self._read_exact(length)
             if masked:
@@ -245,6 +268,41 @@ class AppServerConnection:
             )
             return True
         return False
+
+    def interrupt_turn(self, thread_id: str, turn_id: str | None) -> None:
+        """Best-effort request to stop a turn after a local Ctrl-C.
+
+        This is not on the hot path and must never itself raise or block
+        for long: the caller is already unwinding a KeyboardInterrupt, and
+        the socket is about to be closed regardless of whether the daemon
+        acknowledges the interrupt.
+        """
+        try:
+            # TODO: confirm method name against the app-server protocol;
+            # "turn/interrupt" is a best guess (turn/abort is the other
+            # plausible name). Sent best-effort — if the server doesn't
+            # recognize it, the reply is just a JSON-RPC error we ignore.
+            self.send(
+                {
+                    "method": "turn/interrupt",
+                    "params": {"threadId": thread_id, "turnId": turn_id},
+                }
+            )
+            original_timeout = self._socket.gettimeout()
+            self._socket.settimeout(0.5)
+            deadline = time.monotonic() + 2.0
+            try:
+                while time.monotonic() < deadline:
+                    self.read_message()
+            except (EmmaError, OSError):
+                pass
+            finally:
+                try:
+                    self._socket.settimeout(original_timeout)
+                except OSError:
+                    pass
+        except Exception:
+            pass
 
     def close(self) -> None:
         if getattr(self, "_socket", None) is not None:
@@ -342,121 +400,134 @@ def ask(prompt: str, *, timing: bool) -> None:
 
     with connect() as server:
         connected_at = time.monotonic()
-        thread_result = server.request(
-            "thread/start",
-            {
-                "model": MODEL,
-                "cwd": WORKING_DIRECTORY,
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "ephemeral": True,
-                "developerInstructions": DEVELOPER_INSTRUCTIONS,
-                "config": {
-                    "model_reasoning_effort": "low",
-                    "model_verbosity": "low",
-                },
-            },
-        )
-        thread = thread_result.get("thread", {})
-        thread_id = thread.get("id") if isinstance(thread, dict) else None
-        if not isinstance(thread_id, str):
-            raise EmmaError("thread/start returned no thread id")
-
-        turn_result = server.request(
-            "turn/start",
-            {
-                "threadId": thread_id,
-                "effort": "low",
-                "input": [{"type": "text", "text": prompt}],
-            },
-        )
-        turn = turn_result.get("turn", {})
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-        streamed_items: set[str] = set()
+        thread_id: str | None = None
+        turn_id: str | None = None
         wrote_output = False
-        # Wall-clock deadline for the whole turn, separate from the per-recv
-        # idle timeout: a turn that keeps emitting tokens slowly would never
-        # trip the idle timeout, and an unrecognized terminal state must
-        # still not hang forever.
-        turn_deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
+        try:
+            thread_result = server.request(
+                "thread/start",
+                {
+                    "model": MODEL,
+                    "cwd": WORKING_DIRECTORY,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "ephemeral": True,
+                    "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                    "config": {
+                        "model_reasoning_effort": "low",
+                        "model_verbosity": "low",
+                    },
+                },
+            )
+            thread = thread_result.get("thread", {})
+            thread_id = thread.get("id") if isinstance(thread, dict) else None
+            if not isinstance(thread_id, str):
+                raise EmmaError("thread/start returned no thread id")
 
-        while True:
-            if time.monotonic() > turn_deadline:
-                raise EmmaError(
-                    f"Codex turn exceeded the {TURN_TIMEOUT_SECONDS:g}s total turn deadline"
-                )
+            turn_result = server.request(
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "effort": "low",
+                    "input": [{"type": "text", "text": prompt}],
+                },
+            )
+            turn = turn_result.get("turn", {})
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            streamed_items: set[str] = set()
+            # Wall-clock deadline for the whole turn, separate from the
+            # per-recv idle timeout: a turn that keeps emitting tokens
+            # slowly would never trip the idle timeout, and an
+            # unrecognized terminal state must still not hang forever.
+            turn_deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
 
-            event = server.next_event()
-            method = event.get("method")
-            params = event.get("params", {})
+            while True:
+                if time.monotonic() > turn_deadline:
+                    raise EmmaError(
+                        f"Codex turn exceeded the {TURN_TIMEOUT_SECONDS:g}s total turn deadline"
+                    )
 
-            if "error" in event:
-                error = event["error"]
-                detail = error.get("message") if isinstance(error, dict) else error
-                raise EmmaError(f"Codex reported an error: {detail}")
+                event = server.next_event()
+                method = event.get("method")
+                params = event.get("params", {})
 
-            if not isinstance(params, dict):
-                continue
+                if "error" in event:
+                    error = event["error"]
+                    detail = error.get("message") if isinstance(error, dict) else error
+                    raise EmmaError(f"Codex reported an error: {detail}")
 
-            event_thread_id = params.get("threadId")
-            event_turn_id = params.get("turnId")
-            if event_thread_id not in (None, thread_id):
-                continue
-            if turn_id and event_turn_id not in (None, turn_id):
-                continue
-
-            if method == "item/agentMessage/delta":
-                delta = params.get("delta")
-                item_id = params.get("itemId")
-                if isinstance(delta, str) and delta:
-                    if first_output_at is None:
-                        first_output_at = time.monotonic()
-                    sys.stdout.write(delta)
-                    sys.stdout.flush()
-                    wrote_output = True
-                if isinstance(item_id, str):
-                    streamed_items.add(item_id)
-
-            elif method == "item/completed":
-                item = params.get("item", {})
-                if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                if not isinstance(params, dict):
                     continue
-                item_id = item.get("id")
-                text = item.get("text")
-                if item_id not in streamed_items and isinstance(text, str) and text:
-                    if first_output_at is None:
-                        first_output_at = time.monotonic()
-                    sys.stdout.write(text)
-                    sys.stdout.flush()
-                    wrote_output = True
 
-            elif method == "turn/completed":
-                completed_turn = params.get("turn", {})
-                if isinstance(completed_turn, dict):
-                    status = completed_turn.get("status")
-                    if status == "failed":
-                        error = completed_turn.get("error")
-                        raise EmmaError(f"Codex turn failed: {error}")
-                break
+                event_thread_id = params.get("threadId")
+                event_turn_id = params.get("turnId")
+                if event_thread_id not in (None, thread_id):
+                    continue
+                if turn_id and event_turn_id not in (None, turn_id):
+                    continue
 
-            elif method == "turn/aborted":
-                raise EmmaError("Codex turn was aborted")
+                if method == "item/agentMessage/delta":
+                    delta = params.get("delta")
+                    item_id = params.get("itemId")
+                    if isinstance(delta, str) and delta:
+                        if first_output_at is None:
+                            first_output_at = time.monotonic()
+                        sys.stdout.write(delta)
+                        sys.stdout.flush()
+                        wrote_output = True
+                    if isinstance(item_id, str):
+                        streamed_items.add(item_id)
 
-            elif method == "turn/failed":
-                raise EmmaError(f"Codex turn failed: {params.get('error')}")
+                elif method == "item/completed":
+                    item = params.get("item", {})
+                    if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                        continue
+                    item_id = item.get("id")
+                    text = item.get("text")
+                    if item_id not in streamed_items and isinstance(text, str) and text:
+                        if first_output_at is None:
+                            first_output_at = time.monotonic()
+                        sys.stdout.write(text)
+                        sys.stdout.flush()
+                        wrote_output = True
 
-            elif method == "thread/error":
-                raise EmmaError(f"Codex thread error: {params.get('error')}")
+                elif method == "turn/completed":
+                    completed_turn = params.get("turn", {})
+                    if isinstance(completed_turn, dict):
+                        status = completed_turn.get("status")
+                        if status == "failed":
+                            error = completed_turn.get("error")
+                            raise EmmaError(f"Codex turn failed: {error}")
+                    break
 
-            elif isinstance(method, str) and method.startswith("turn/"):
-                # Any other turn/* method is a terminal state this file
-                # doesn't know the name of yet; end the turn rather than
-                # hang until the idle or total-turn timeout.
-                break
+                elif method == "turn/aborted":
+                    raise EmmaError("Codex turn was aborted")
 
-        if wrote_output:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+                elif method == "turn/failed":
+                    raise EmmaError(f"Codex turn failed: {params.get('error')}")
+
+                elif method == "thread/error":
+                    raise EmmaError(f"Codex thread error: {params.get('error')}")
+
+                elif isinstance(method, str) and method.startswith("turn/"):
+                    # Any other turn/* method is a terminal state this file
+                    # doesn't know the name of yet; end the turn rather than
+                    # hang until the idle or total-turn timeout.
+                    break
+        except KeyboardInterrupt:
+            # The daemon is still generating tokens for this turn even
+            # though nobody is reading them. Ask it to stop before
+            # re-raising so a Ctrl-C doesn't burn paid-for output on a
+            # thread nobody will see the rest of.
+            if thread_id is not None:
+                server.interrupt_turn(thread_id, turn_id)
+            raise
+        finally:
+            # Runs on the error path too, so a mid-stream failure never
+            # leaves the cursor mid-line for the next shell prompt.
+            if wrote_output:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
 
     finished = time.monotonic()
     if timing:
