@@ -39,6 +39,17 @@ automatically when the socket is unavailable. Every question gets a fresh,
 ephemeral, read-only thread with approvals disabled and instructions not to run
 tools or access external services.
 
+### Daemon lifecycle
+
+You do not need to start the daemon yourself. On every invocation, Emma first
+tries to connect to Codex's managed socket. If the socket is unavailable, Emma
+runs `codex app-server daemon start`, reconnects, and submits the same question.
+
+The daemon remains running after Emma exits and after the terminal is closed. A
+reboot, crash, or manual `codex app-server daemon stop` ends it; the next Emma
+call starts it again automatically. That first call may be slightly slower while
+the daemon starts.
+
 ## Configuration
 
 Environment variables provide lightweight overrides:
