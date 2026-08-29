@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any
 
 
+VERSION = "0.1.0"
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.environ.get(name)
     if raw is None:
@@ -78,7 +81,7 @@ class AppServerConnection:
                     "clientInfo": {
                         "name": "emma",
                         "title": "Emma Terminal Assistant",
-                        "version": "0.1.0",
+                        "version": VERSION,
                     }
                 },
             )
@@ -413,6 +416,14 @@ def ask(prompt: str, *, timing: bool) -> None:
                     "sandbox": "read-only",
                     "ephemeral": True,
                     "developerInstructions": DEVELOPER_INSTRUCTIONS,
+                    # NOTE: reasoning effort is set both here
+                    # (config.model_reasoning_effort) and again below on
+                    # turn/start (effort). It's unconfirmed which one the
+                    # app-server actually honors — nothing in the
+                    # initialize response or a local Codex schema settled
+                    # it, and Codex isn't installed in this environment to
+                    # check empirically. Left as both rather than guessing
+                    # and silently dropping the one that matters.
                     "config": {
                         "model_reasoning_effort": "low",
                         "model_verbosity": "low",
@@ -428,6 +439,7 @@ def ask(prompt: str, *, timing: bool) -> None:
                 "turn/start",
                 {
                     "threadId": thread_id,
+                    # See the NOTE on thread/start's config above.
                     "effort": "low",
                     "input": [{"type": "text", "text": prompt}],
                 },
@@ -541,18 +553,72 @@ def ask(prompt: str, *, timing: bool) -> None:
         )
 
 
-def main(argv: list[str]) -> int:
-    timing = bool(argv and argv[0] == "--timing")
-    if timing:
-        argv = argv[1:]
+USAGE = "Usage: emma [--timing] [--] <question>"
+HELP_TEXT = f"""{USAGE}
 
-    if argv:
-        prompt = " ".join(argv).strip()
-    elif not sys.stdin.isatty():
-        prompt = sys.stdin.read().strip()
-    else:
-        print("Usage: emma [--timing] <question>", file=sys.stderr)
+Ask Codex's app-server a quick terminal question and stream the answer.
+
+Options:
+  --timing       print phase-by-phase timing to stderr
+  -h, --help     show this help message and exit
+  --version      show version and exit
+  --             treat all remaining arguments as the question, even
+                 if they start with a dash
+
+The question may come from argv, from piped stdin, or both: if stdin is
+piped and argv is also given, the piped input is appended to the argv
+question as additional context (e.g. `git log | emma what changed here`).
+"""
+
+
+def parse_args(argv: list[str]) -> tuple[str, list[str], bool]:
+    """Parse argv into (action, question_parts, timing).
+
+    action is "help", "version", or "run". question_parts and timing are
+    only meaningful for "run".
+    """
+    timing = False
+    question_parts: list[str] = []
+    end_of_options = False
+
+    for arg in argv:
+        if not end_of_options:
+            if arg == "--":
+                end_of_options = True
+                continue
+            if arg == "--timing":
+                timing = True
+                continue
+            if arg in ("-h", "--help"):
+                return "help", [], False
+            if arg == "--version":
+                return "version", [], False
+        question_parts.append(arg)
+
+    return "run", question_parts, timing
+
+
+def main(argv: list[str]) -> int:
+    action, question_parts, timing = parse_args(argv)
+    if action == "help":
+        print(HELP_TEXT)
+        return 0
+    if action == "version":
+        print(VERSION)
+        return 0
+
+    have_stdin = not sys.stdin.isatty()
+    if not question_parts and not have_stdin:
+        print(USAGE, file=sys.stderr)
         return 2
+
+    argv_prompt = " ".join(question_parts).strip()
+    stdin_context = sys.stdin.read().strip() if have_stdin else ""
+
+    if argv_prompt and stdin_context:
+        prompt = f"{argv_prompt}\n\n--- piped input ---\n{stdin_context}"
+    else:
+        prompt = argv_prompt or stdin_context
 
     if not prompt:
         print("emma: question cannot be empty", file=sys.stderr)
