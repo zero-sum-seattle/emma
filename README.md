@@ -2,9 +2,13 @@
 
 <img src="assets/emma-mascot.png" alt="Emma mascot" width="240">
 
-Emma is a small Ubuntu terminal helper backed by the persistent Codex app-server.
-It connects to Codex's managed Unix socket, asks a concise question using
-`gpt-5.6-luna`, streams the answer, and exits while the app-server stays running.
+Emma is a tiny terminal assistant built on top of the persistent Codex app-server.
+
+She connects to Codex's managed Unix socket, sends a focused question to gpt-5.6-luna, streams the answer straight back to your terminal, and then gets out of the way. The app-server keeps running, so Emma doesn't have to wake up an entirely new Codex process every time you ask something.
+
+Think of her as the AI coworker living in your terminal: quick to answer, low on ceremony, and always one command away.
+
+Emma is intentionally small and focused. She's great for quick questions, command help, explanations, sanity checks, and all the little things that don't need a full interactive Codex session.
 
 ## Requirements
 
