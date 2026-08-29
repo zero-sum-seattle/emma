@@ -59,17 +59,16 @@ and `--version` are handled directly and never touch the network or socket.
 
 ### Personalization
 
-Emma automatically picks up persistent, personal instructions from:
+Emma automatically picks up persistent, personal preferences from:
 
 ```
 ~/.config/emma/EMMA.md
 ```
 
-If that file exists, its contents are sent with every question as
-standing instructions — separate from the question itself, and separate
-from Codex's own `AGENTS.md` handling (Emma never reads or parses
-`AGENTS.md`; that stays entirely Codex's responsibility). If the file
-doesn't exist, Emma runs exactly as before — nothing is required.
+If that file exists, its contents are sent as **user-level** context ahead
+of every question — not developer-level policy, and not the question
+itself. If the file doesn't exist, Emma runs exactly as before — nothing is
+required.
 
 Example `~/.config/emma/EMMA.md`:
 
@@ -86,6 +85,11 @@ For programming:
 - challenge questionable assumptions
 ```
 
+It's capped at 128 KiB (`MAX_INSTRUCTIONS_FILE_BYTES` in the script) — Emma
+is meant to stay fast, and an instructions file is meant to hold a page of
+preferences, not a log dump. A file over the limit is a clean error that
+exits non-zero before anything is sent to Codex.
+
 Two flags adjust this per invocation:
 
 ```bash
@@ -94,17 +98,34 @@ emma --instructions ./instructions.md "review this code"
 emma --no-user-instructions "why is this systemd service failing?"
 ```
 
-- `--instructions <file>` adds an extra, more specific instructions file
-  on top of `~/.config/emma/EMMA.md` for just that call.
+- `--instructions <file>` adds an extra, more specific file of user-level
+  instructions on top of `~/.config/emma/EMMA.md` for just that call. It's
+  subject to the same 128 KiB limit.
 - `--no-user-instructions` skips `~/.config/emma/EMMA.md` for that call
   (an explicitly passed `--instructions` file is still used).
 
-From least to most specific, instructions layer as: Codex/system-level
-instructions, Codex's own `AGENTS.md` handling, `~/.config/emma/EMMA.md`,
-then `--instructions <file>`, with the question itself always last. A
-missing `~/.config/emma/EMMA.md` is silent and normal; a missing or
-unreadable file passed to `--instructions` is a clean error that exits
-non-zero before anything is sent to Codex.
+Layered from least to most specific:
+
+1. Emma's own built-in developer instructions (`DEVELOPER_INSTRUCTIONS` in
+   the script) — unaffected by any of this, always sent as
+   `thread/start`'s `developerInstructions`.
+2. Codex's own project-context handling, including `AGENTS.md` — entirely
+   Codex's responsibility. Emma never reads, parses, or otherwise touches
+   `AGENTS.md`. Whether Codex finds one at all, and which one, depends on
+   the thread's working directory (`cwd`), which Emma sets from `EMMA_CWD`
+   — **and `EMMA_CWD` defaults to `/tmp`**, so a plain `emma "..."` run
+   from inside a project does *not* by itself put that project's
+   `AGENTS.md` in play. Set `EMMA_CWD` to the project directory when you
+   want Codex to operate relative to it.
+3. `~/.config/emma/EMMA.md`, as user-level context.
+4. `--instructions <file>`, layered after it, also user-level.
+5. The command-line question itself — always last, always the most
+   specific, and never rewritten by any of the above.
+
+A missing `~/.config/emma/EMMA.md` is silent and normal; a missing,
+oversized, non-UTF-8, or unreadable file passed to `--instructions` (or an
+oversized/unreadable `EMMA.md` that does exist) is a clean error that
+exits non-zero before anything is sent to Codex.
 
 ### Daemon lifecycle
 
@@ -129,7 +150,9 @@ Environment variables provide lightweight overrides:
 - `EMMA_TURN_TIMEOUT` — wall-clock deadline in seconds for an entire turn,
   from `turn/start` to completion. This is the setting that bounds total
   response time. Defaults to `300`.
-- `EMMA_CWD` — thread working directory; defaults to `/tmp`
+- `EMMA_CWD` — thread working directory; defaults to `/tmp`. This is also
+  what governs whether Codex's own `AGENTS.md` discovery has a project to
+  find (see Personalization).
 - `EMMA_CODEX` — path to the Codex executable
 - `EMMA_SOCKET` — path to the managed app-server Unix socket
 - `EMMA_USER_INSTRUCTIONS` — overrides the default personal instructions
@@ -145,11 +168,14 @@ traceback.
 1. Connect to `~/.codex/app-server-control/app-server-control.sock`.
 2. Perform a WebSocket upgrade over the Unix socket.
 3. Send `initialize`, `thread/start`, and `turn/start` app-server messages.
-   `thread/start`'s `developerInstructions` carries Emma's own base
-   instructions plus, when present, `~/.config/emma/EMMA.md` and/or
-   `--instructions <file>` — that's the protocol's own layer for
-   persistent, out-of-band guidance, so the question sent in `turn/start`
-   stays exactly what was typed.
+   `thread/start`'s `developerInstructions` carries only Emma's own base
+   instructions — user preferences never go there. Instead, `turn/start`'s
+   `input` is a list of `{"type": "text", ...}` items: any content from
+   `~/.config/emma/EMMA.md` and/or `--instructions <file>` becomes its own
+   leading item, in least-to-most-specific order, and the question itself
+   is always the final item, unmodified. (This list shape is inferred from
+   the app-server's existing single-item usage, not confirmed against a
+   live server — Codex isn't installed in this environment.)
 4. Stream `item/agentMessage/delta` events to the terminal.
 5. Close the client connection while leaving Codex's daemon running.
 

@@ -102,10 +102,10 @@ class MainPromptAssemblyTest(unittest.TestCase):
     def _run(self, argv, stdin_text=None, stdin_isatty=True):
         captured = {}
 
-        def fake_ask(prompt, *, timing, extra_instructions=None):
+        def fake_ask(prompt, *, timing, user_instructions=None):
             captured["prompt"] = prompt
             captured["timing"] = timing
-            captured["extra_instructions"] = extra_instructions
+            captured["user_instructions"] = user_instructions
 
         real_ask = emma.ask
         real_stdin = sys.stdin
@@ -170,7 +170,7 @@ class MainPromptAssemblyTest(unittest.TestCase):
         rc, captured = self._run(["what", "is", "chmod"], stdin_text=None)
         self.assertEqual(rc, 0)
         self.assertEqual(captured["prompt"], "what is chmod")
-        self.assertIsNone(captured["extra_instructions"])
+        self.assertEqual(captured["user_instructions"], [])
 
     def test_default_instructions_loaded(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,7 +181,8 @@ class MainPromptAssemblyTest(unittest.TestCase):
             rc, captured = self._run(["what", "is", "chmod"], stdin_text=None)
             self.assertEqual(rc, 0)
             self.assertEqual(captured["prompt"], "what is chmod")
-            self.assertIn("Keep answers concise.", captured["extra_instructions"])
+            self.assertEqual(len(captured["user_instructions"]), 1)
+            self.assertIn("Keep answers concise.", captured["user_instructions"][0])
 
     def test_no_user_instructions_flag_skips_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,7 +195,7 @@ class MainPromptAssemblyTest(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
             self.assertEqual(captured["prompt"], "what is chmod")
-            self.assertIsNone(captured["extra_instructions"])
+            self.assertEqual(captured["user_instructions"], [])
 
     def test_instructions_flag_loads_explicit_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -206,7 +207,29 @@ class MainPromptAssemblyTest(unittest.TestCase):
             )
             self.assertEqual(rc, 0)
             self.assertEqual(captured["prompt"], "review this")
-            self.assertIn("Be terse.", captured["extra_instructions"])
+            self.assertEqual(len(captured["user_instructions"]), 1)
+            self.assertIn("Be terse.", captured["user_instructions"][0])
+
+    def test_no_user_instructions_flag_still_allows_explicit_instructions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = Path(tmp) / "EMMA.md"
+            default_path.write_text("GLOBAL_MARKER\n")
+            explicit_path = Path(tmp) / "notes.md"
+            explicit_path.write_text("EXPLICIT_MARKER\n")
+            os.environ["EMMA_USER_INSTRUCTIONS"] = str(default_path)
+
+            rc, captured = self._run(
+                [
+                    "--no-user-instructions",
+                    "--instructions",
+                    str(explicit_path),
+                    "review this",
+                ],
+                stdin_text=None,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(captured["user_instructions"]), 1)
+            self.assertIn("EXPLICIT_MARKER", captured["user_instructions"][0])
 
     def test_default_and_explicit_instructions_combined_in_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -220,12 +243,12 @@ class MainPromptAssemblyTest(unittest.TestCase):
                 ["--instructions", str(explicit_path), "review this"], stdin_text=None
             )
             self.assertEqual(rc, 0)
-            extra = captured["extra_instructions"]
-            self.assertIn("GLOBAL_MARKER", extra)
-            self.assertIn("EXPLICIT_MARKER", extra)
+            sections = captured["user_instructions"]
+            self.assertEqual(len(sections), 2)
             # Least specific (default EMMA.md) first, most specific
             # (--instructions) last, per the documented precedence.
-            self.assertLess(extra.index("GLOBAL_MARKER"), extra.index("EXPLICIT_MARKER"))
+            self.assertIn("GLOBAL_MARKER", sections[0])
+            self.assertIn("EXPLICIT_MARKER", sections[1])
 
     def test_user_prompt_stays_intact_alongside_instructions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -246,6 +269,15 @@ class MainPromptAssemblyTest(unittest.TestCase):
         )
         self.assertEqual(rc, 1)
         self.assertNotIn("prompt", captured)
+
+    def test_oversized_explicit_instructions_file_returns_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit_path = Path(tmp) / "huge.md"
+            explicit_path.write_text("x" * (emma.MAX_INSTRUCTIONS_FILE_BYTES + 1))
+
+            rc, captured = self._run(["--instructions", str(explicit_path), "hi"], stdin_text=None)
+            self.assertEqual(rc, 1)
+            self.assertNotIn("prompt", captured)
 
 
 class VersionConsistencyTest(unittest.TestCase):
@@ -298,30 +330,32 @@ class UserInstructionsTest(unittest.TestCase):
         path.write_text(content)
         return path
 
-    def test_no_default_file_returns_none(self):
+    def test_no_default_file_returns_empty_list(self):
         result = emma.resolve_user_instructions(explicit_path=None, skip_default=False)
-        self.assertIsNone(result)
+        self.assertEqual(result, [])
 
     def test_default_file_is_loaded(self):
         default_path = self._write("EMMA.md", "Keep answers concise.\n")
         os.environ["EMMA_USER_INSTRUCTIONS"] = str(default_path)
 
         result = emma.resolve_user_instructions(explicit_path=None, skip_default=False)
-        self.assertIn("Keep answers concise.", result)
-        self.assertIn(str(default_path), result)
+        self.assertEqual(len(result), 1)
+        self.assertIn("Keep answers concise.", result[0])
+        self.assertIn(str(default_path), result[0])
 
     def test_skip_default_skips_even_if_present(self):
         default_path = self._write("EMMA.md", "Keep answers concise.\n")
         os.environ["EMMA_USER_INSTRUCTIONS"] = str(default_path)
 
         result = emma.resolve_user_instructions(explicit_path=None, skip_default=True)
-        self.assertIsNone(result)
+        self.assertEqual(result, [])
 
     def test_explicit_file_is_loaded(self):
         explicit_path = self._write("notes.md", "Be terse.\n")
 
         result = emma.resolve_user_instructions(explicit_path=str(explicit_path), skip_default=True)
-        self.assertIn("Be terse.", result)
+        self.assertEqual(len(result), 1)
+        self.assertIn("Be terse.", result[0])
 
     def test_default_and_explicit_combined_order(self):
         default_path = self._write("EMMA.md", "GLOBAL_MARKER\n")
@@ -331,7 +365,9 @@ class UserInstructionsTest(unittest.TestCase):
         result = emma.resolve_user_instructions(
             explicit_path=str(explicit_path), skip_default=False
         )
-        self.assertLess(result.index("GLOBAL_MARKER"), result.index("EXPLICIT_MARKER"))
+        self.assertEqual(len(result), 2)
+        self.assertIn("GLOBAL_MARKER", result[0])
+        self.assertIn("EXPLICIT_MARKER", result[1])
 
     def test_missing_explicit_file_raises(self):
         with self.assertRaises(emma.EmmaError):
@@ -347,7 +383,37 @@ class UserInstructionsTest(unittest.TestCase):
             result = emma.resolve_user_instructions(explicit_path=None, skip_default=False)
         except emma.EmmaError as exc:
             self.fail(f"missing default file raised: {exc}")
-        self.assertIsNone(result)
+        self.assertEqual(result, [])
+
+    def test_oversized_default_file_raises(self):
+        default_path = self._write("EMMA.md", "x" * (emma.MAX_INSTRUCTIONS_FILE_BYTES + 1))
+        os.environ["EMMA_USER_INSTRUCTIONS"] = str(default_path)
+
+        with self.assertRaises(emma.EmmaError) as ctx:
+            emma.resolve_user_instructions(explicit_path=None, skip_default=False)
+        self.assertIn("too large", str(ctx.exception))
+
+    def test_oversized_explicit_file_raises(self):
+        explicit_path = self._write("notes.md", "x" * (emma.MAX_INSTRUCTIONS_FILE_BYTES + 1))
+
+        with self.assertRaises(emma.EmmaError) as ctx:
+            emma.resolve_user_instructions(explicit_path=str(explicit_path), skip_default=True)
+        self.assertIn("too large", str(ctx.exception))
+
+    def test_file_at_exactly_the_limit_is_allowed(self):
+        default_path = self._write("EMMA.md", "x" * emma.MAX_INSTRUCTIONS_FILE_BYTES)
+        os.environ["EMMA_USER_INSTRUCTIONS"] = str(default_path)
+
+        result = emma.resolve_user_instructions(explicit_path=None, skip_default=False)
+        self.assertEqual(len(result), 1)
+
+    def test_invalid_utf8_explicit_file_raises_clean_error(self):
+        explicit_path = Path(self.tmpdir.name) / "binary.md"
+        explicit_path.write_bytes(b"\xff\xfe not valid utf-8")
+
+        with self.assertRaises(emma.EmmaError) as ctx:
+            emma.resolve_user_instructions(explicit_path=str(explicit_path), skip_default=True)
+        self.assertIn("UTF-8", str(ctx.exception))
 
     @unittest.skipIf(os.name != "posix" or os.geteuid() == 0, "requires non-root POSIX")
     def test_unreadable_default_file_raises(self):
@@ -374,7 +440,11 @@ class UserInstructionsTest(unittest.TestCase):
 class EnvValidationTest(unittest.TestCase):
     def _run_emma(self, env_overrides, argv):
         env = dict(os.environ)
-        env.setdefault("EMMA_USER_INSTRUCTIONS", NO_DEFAULT_INSTRUCTIONS)
+        # Unconditional, then overridden per-test: setdefault() would leave
+        # a real developer's own EMMA_USER_INSTRUCTIONS (and thus their
+        # actual ~/.config/emma/EMMA.md) in play for any test that doesn't
+        # explicitly override it.
+        env["EMMA_USER_INSTRUCTIONS"] = NO_DEFAULT_INSTRUCTIONS
         env.update(env_overrides)
         return subprocess.run(
             [sys.executable, str(EMMA_PATH), *argv],
@@ -421,7 +491,9 @@ class EnvValidationTest(unittest.TestCase):
 
     def test_missing_instructions_file_is_clean_and_never_touches_network(self):
         # Even with no socket/codex configured, a bad --instructions path
-        # must fail before any connection attempt (no partial request).
+        # must fail before any connection attempt (no partial request): the
+        # error must be about the instructions file, never about the
+        # daemon/socket that a real connection attempt would have hit.
         result = self._run_emma(
             {
                 "EMMA_SOCKET": "/tmp/emma-test-nonexistent.sock",
@@ -430,7 +502,8 @@ class EnvValidationTest(unittest.TestCase):
             ["--instructions", "/nonexistent/emma-test/notes.md", "hi"],
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("emma:", result.stderr)
+        self.assertIn("emma: --instructions file not found", result.stderr)
+        self.assertNotIn("daemon", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_instructions_flag_missing_value_is_usage_error(self):

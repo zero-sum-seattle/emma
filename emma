@@ -58,6 +58,11 @@ WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 # header (the 127-length marker allows up to 2^64) shouldn't make
 # _read_exact loop allocating memory forever.
 MAX_FRAME_BYTES = 32 * 1024 * 1024
+# Emma is meant to stay fast and lightweight; an instructions file is meant
+# to hold a few lines of preferences, not a log dump or a book. 128 KiB is
+# generous for that while still catching `--instructions huge-file.txt`
+# before it turns every question into a slow, expensive turn.
+MAX_INSTRUCTIONS_FILE_BYTES = 128 * 1024
 
 
 class EmmaError(RuntimeError):
@@ -374,10 +379,34 @@ def default_instructions_path() -> Path:
     return Path("~/.config/emma/EMMA.md").expanduser()
 
 
-def _read_instructions_file(path: Path, *, label: str) -> str:
+def _read_instructions_file(path: Path, *, label: str, optional: bool = False) -> str | None:
+    """Read one instructions file as UTF-8, enforcing MAX_INSTRUCTIONS_FILE_BYTES.
+
+    optional=True additionally swallows FileNotFoundError and returns None
+    instead of raising, for the default EMMA.md file, where a missing file
+    is normal. Every other failure — including on an optional file that
+    does exist — is a genuine problem and raises EmmaError.
+    """
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise EmmaError(f"{label} not found: {path}") from None
+    except OSError as exc:
+        raise EmmaError(f"cannot read {label} {path}: {exc.strerror or exc}") from exc
+
+    if size > MAX_INSTRUCTIONS_FILE_BYTES:
+        raise EmmaError(
+            f"{label} {path} is too large "
+            f"({size} bytes; the limit is {MAX_INSTRUCTIONS_FILE_BYTES} bytes)"
+        )
+
     try:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
+        if optional:
+            return None
         raise EmmaError(f"{label} not found: {path}") from None
     except IsADirectoryError:
         raise EmmaError(f"{label} is a directory, not a file: {path}") from None
@@ -389,19 +418,20 @@ def _read_instructions_file(path: Path, *, label: str) -> str:
 
 def resolve_user_instructions(
     *, explicit_path: str | None, skip_default: bool
-) -> str | None:
-    """Resolve persistent + per-invocation instructions into one block.
+) -> list[str]:
+    """Resolve persistent + per-invocation instructions into ordered,
+    labeled, user-level text blocks — least specific first.
 
-    Returns None when there's nothing to add. Sections are ordered least to
-    most specific (default EMMA.md, then --instructions) to match the
-    documented precedence, so the more specific file's guidance reads last
-    and closest to the user's actual request. Raises EmmaError on a genuine
-    problem — an unreadable default file, or a missing/unreadable explicit
-    --instructions file — so main() can bail out before ever contacting
-    Codex rather than sending a partial request.
+    These are user-level context, not developer policy: callers must send
+    them as (or alongside) the turn's own input, never folded into
+    DEVELOPER_INSTRUCTIONS. Returns [] when there's nothing to add.
+    Raises EmmaError on a genuine problem — an oversized/unreadable default
+    file, or a missing/oversized/unreadable explicit --instructions file —
+    so main() can bail out before ever contacting Codex rather than sending
+    a partial request.
 
-    A missing default file is normal and silent: only FileNotFoundError on
-    that specific path is swallowed here.
+    A missing default EMMA.md is normal and silent; a missing explicit
+    --instructions file is an error.
     """
     from pathlib import Path
 
@@ -409,29 +439,16 @@ def resolve_user_instructions(
 
     if not skip_default:
         default_path = default_instructions_path()
-        try:
-            text = default_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            text = None
-        except UnicodeDecodeError as exc:
-            raise EmmaError(
-                f"{default_path} is not valid UTF-8 ({exc})"
-            ) from exc
-        except OSError as exc:
-            raise EmmaError(
-                f"cannot read {default_path}: {exc.strerror or exc}"
-            ) from exc
+        text = _read_instructions_file(default_path, label="EMMA.md", optional=True)
         if text is not None:
-            sections.append(f"User instructions from {default_path}:\n{text}")
+            sections.append(f"User preferences from {default_path}:\n{text}")
 
     if explicit_path:
         path = Path(explicit_path).expanduser()
         text = _read_instructions_file(path, label="--instructions file")
-        sections.append(f"User instructions from {path} (--instructions):\n{text}")
+        sections.append(f"Additional invocation instructions from {path}:\n{text}")
 
-    if not sections:
-        return None
-    return "\n\n".join(sections)
+    return sections
 
 
 def start_daemon(codex: str) -> None:
@@ -525,22 +542,27 @@ def _warn_if_codex_newer(initialize_result: dict[str, Any]) -> None:
         )
 
 
-def ask(prompt: str, *, timing: bool, extra_instructions: str | None = None) -> None:
+def ask(prompt: str, *, timing: bool, user_instructions: list[str] | None = None) -> None:
     started = time.monotonic()
     # Cumulative phase timestamps for --timing, in the order they're
     # expected to complete: connect, initialize, thread_start, turn_start,
     # first_output, total. Each value is seconds since `started`.
     timings: dict[str, float] = {}
 
-    # extra_instructions (from ~/.config/emma/EMMA.md and/or --instructions)
-    # rides in the thread's developerInstructions rather than being
-    # concatenated into the user's prompt: the app-server already exposes
-    # developerInstructions as a protocol-native layer for exactly this kind
-    # of persistent, out-of-band guidance, so `prompt` below stays the
-    # user's actual request, untouched.
-    developer_instructions = DEVELOPER_INSTRUCTIONS
-    if extra_instructions:
-        developer_instructions = f"{DEVELOPER_INSTRUCTIONS}\n{extra_instructions}"
+    # user_instructions (from ~/.config/emma/EMMA.md and/or --instructions)
+    # are user-level context, not developer policy, so they must not be
+    # folded into DEVELOPER_INSTRUCTIONS below. turn/start's "input" is
+    # already a list of {"type": "text", ...} items rather than a single
+    # string, which reads as the protocol's own room for multiple ordered
+    # user-level inputs in one turn — so each instructions file becomes its
+    # own leading item, and `prompt` stays the final item, unmodified and
+    # still the most specific one. This shape is inferred from the existing
+    # single-item usage, not confirmed against a live app-server (Codex
+    # isn't installed in this environment); if the server instead expects
+    # one "text" per turn, the extra items would need folding into a single
+    # string here instead.
+    input_items = [{"type": "text", "text": text} for text in (user_instructions or [])]
+    input_items.append({"type": "text", "text": prompt})
 
     with connect() as server:
         timings["connect"] = time.monotonic() - started
@@ -560,7 +582,7 @@ def ask(prompt: str, *, timing: bool, extra_instructions: str | None = None) -> 
                     "approvalPolicy": "never",
                     "sandbox": "read-only",
                     "ephemeral": True,
-                    "developerInstructions": developer_instructions,
+                    "developerInstructions": DEVELOPER_INSTRUCTIONS,
                     # NOTE: reasoning effort is set both here
                     # (config.model_reasoning_effort) and again below on
                     # turn/start (effort). It's unconfirmed which one the
@@ -587,7 +609,7 @@ def ask(prompt: str, *, timing: bool, extra_instructions: str | None = None) -> 
                     "threadId": thread_id,
                     # See the NOTE on thread/start's config above.
                     "effort": "low",
-                    "input": [{"type": "text", "text": prompt}],
+                    "input": input_items,
                 },
             )
             turn = turn_result.get("turn", {})
@@ -721,9 +743,9 @@ piped and argv is also given, the piped input is appended to the argv
 question as additional context (e.g. `git log | emma what changed here`).
 
 Personalization: if ~/.config/emma/EMMA.md exists, its contents are sent as
-persistent instructions with every question. This is separate from Codex's
-own AGENTS.md handling, which Emma does not touch. See the README for
-details and an example EMMA.md.
+user-level preferences ahead of every question, most specific last. This is
+separate from Codex's own AGENTS.md handling, which Emma does not touch or
+read. See the README for details, the size limit, and an example EMMA.md.
 """
 
 
@@ -827,12 +849,12 @@ def main(argv: list[str]) -> int:
 
     try:
         # Resolved before ask() connects to anything, so a bad
-        # --instructions path (or an unreadable EMMA.md) never results in a
-        # partial request reaching Codex.
-        extra_instructions = resolve_user_instructions(
+        # --instructions path (or an oversized/unreadable EMMA.md) never
+        # results in a partial request reaching Codex.
+        user_instructions = resolve_user_instructions(
             explicit_path=instructions_path, skip_default=no_user_instructions
         )
-        ask(prompt, timing=timing, extra_instructions=extra_instructions)
+        ask(prompt, timing=timing, user_instructions=user_instructions)
         return 0
     except KeyboardInterrupt:
         print("\nemma: interrupted", file=sys.stderr)
