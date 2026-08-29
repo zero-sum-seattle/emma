@@ -18,7 +18,15 @@ from typing import Any
 
 
 MODEL = os.environ.get("EMMA_MODEL", "gpt-5.6-luna")
-TIMEOUT_SECONDS = float(os.environ.get("EMMA_TIMEOUT", "120"))
+# EMMA_TIMEOUT (aliased as EMMA_IDLE_TIMEOUT) is a per-recv *idle* timeout:
+# how long a single socket read may block before giving up. It is not a cap
+# on the whole response, so a turn that keeps emitting tokens, even slowly,
+# never trips it. EMMA_TURN_TIMEOUT is the separate wall-clock deadline for
+# an entire turn, from turn/start to completion.
+IDLE_TIMEOUT_SECONDS = float(
+    os.environ.get("EMMA_IDLE_TIMEOUT", os.environ.get("EMMA_TIMEOUT", "120"))
+)
+TURN_TIMEOUT_SECONDS = float(os.environ.get("EMMA_TURN_TIMEOUT", "300"))
 WORKING_DIRECTORY = os.environ.get("EMMA_CWD", "/tmp")
 DEVELOPER_INSTRUCTIONS = """\
 You are Emma, a fast terminal reference assistant for Ubuntu and Unix-like systems.
@@ -41,7 +49,7 @@ class AppServerConnection:
         self._pending: list[dict[str, Any]] = []
         self._incoming = bytearray()
         self._socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._socket.settimeout(TIMEOUT_SECONDS)
+        self._socket.settimeout(IDLE_TIMEOUT_SECONDS)
 
         try:
             self._socket.connect(str(socket_path))
@@ -120,7 +128,7 @@ class AppServerConnection:
                 chunk = self._socket.recv(max(4096, size - len(self._incoming)))
             except socket.timeout as exc:
                 raise EmmaError(
-                    f"Codex did not respond within {TIMEOUT_SECONDS:g} seconds"
+                    f"Codex did not respond within {IDLE_TIMEOUT_SECONDS:g} seconds (idle timeout)"
                 ) from exc
             if not chunk:
                 raise EmmaError("Codex app-server closed the connection")
@@ -192,6 +200,8 @@ class AppServerConnection:
 
         while True:
             message = self.read_message()
+            if self._reply_if_inbound_request(message):
+                continue
             if message.get("id") != request_id:
                 self._pending.append(message)
                 continue
@@ -208,9 +218,33 @@ class AppServerConnection:
             return result if isinstance(result, dict) else {}
 
     def next_event(self) -> dict[str, Any]:
-        if self._pending:
-            return self._pending.pop(0)
-        return self.read_message()
+        while True:
+            message = self._pending.pop(0) if self._pending else self.read_message()
+            if self._reply_if_inbound_request(message):
+                continue
+            return message
+
+    def _reply_if_inbound_request(self, message: dict[str, Any]) -> bool:
+        """Reply to a server-initiated request so it can't deadlock us.
+
+        A message carrying both "id" and "method" is a request *from* the
+        app-server (an approval prompt, an auth refresh, a capability
+        probe, ...), not a response or a notification. Emma doesn't
+        implement any server-initiated methods, so answer with a
+        JSON-RPC "method not found" error instead of silently dropping it
+        — dropping it would leave the server waiting for a reply Emma will
+        never send, while Emma waits for a message the server will never
+        send, and both sides hang until the idle timeout.
+        """
+        if "id" in message and "method" in message:
+            self.send(
+                {
+                    "id": message["id"],
+                    "error": {"code": -32601, "message": "method not found"},
+                }
+            )
+            return True
+        return False
 
     def close(self) -> None:
         if getattr(self, "_socket", None) is not None:
@@ -340,11 +374,27 @@ def ask(prompt: str, *, timing: bool) -> None:
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         streamed_items: set[str] = set()
         wrote_output = False
+        # Wall-clock deadline for the whole turn, separate from the per-recv
+        # idle timeout: a turn that keeps emitting tokens slowly would never
+        # trip the idle timeout, and an unrecognized terminal state must
+        # still not hang forever.
+        turn_deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
 
         while True:
+            if time.monotonic() > turn_deadline:
+                raise EmmaError(
+                    f"Codex turn exceeded the {TURN_TIMEOUT_SECONDS:g}s total turn deadline"
+                )
+
             event = server.next_event()
             method = event.get("method")
             params = event.get("params", {})
+
+            if "error" in event:
+                error = event["error"]
+                detail = error.get("message") if isinstance(error, dict) else error
+                raise EmmaError(f"Codex reported an error: {detail}")
+
             if not isinstance(params, dict):
                 continue
 
@@ -387,6 +437,21 @@ def ask(prompt: str, *, timing: bool) -> None:
                     if status == "failed":
                         error = completed_turn.get("error")
                         raise EmmaError(f"Codex turn failed: {error}")
+                break
+
+            elif method == "turn/aborted":
+                raise EmmaError("Codex turn was aborted")
+
+            elif method == "turn/failed":
+                raise EmmaError(f"Codex turn failed: {params.get('error')}")
+
+            elif method == "thread/error":
+                raise EmmaError(f"Codex thread error: {params.get('error')}")
+
+            elif isinstance(method, str) and method.startswith("turn/"):
+                # Any other turn/* method is a terminal state this file
+                # doesn't know the name of yet; end the turn rather than
+                # hang until the idle or total-turn timeout.
                 break
 
         if wrote_output:
