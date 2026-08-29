@@ -263,21 +263,50 @@ def start_daemon(codex: str) -> None:
         raise EmmaError(f"could not start the Codex app-server daemon: {detail}")
 
 
-def connect(codex: str) -> AppServerConnection:
+def connect() -> AppServerConnection:
     socket_path = find_socket()
     try:
         return AppServerConnection(socket_path)
     except (EmmaError, OSError):
+        # Codex is only resolved here, on the cold path where the daemon
+        # actually needs to be started. A warm invocation against an
+        # already-running daemon never pays a PATH scan and never fails
+        # just because `codex` isn't on this shell's PATH.
+        codex = find_codex()
         start_daemon(codex)
-        return AppServerConnection(socket_path)
+        return _connect_with_retry(socket_path)
+
+
+def _connect_with_retry(socket_path: Path) -> AppServerConnection:
+    """Poll for the daemon's socket to accept connections after start_daemon().
+
+    `codex app-server daemon start` returning success only means the start
+    command exited; it does not guarantee the socket is bound and accepting
+    yet. Retry with exponential backoff instead of a single immediate retry.
+    """
+    delay = 0.05
+    deadline = time.monotonic() + 5.0
+    last_exc: BaseException | None = None
+    while True:
+        try:
+            return AppServerConnection(socket_path)
+        except (EmmaError, OSError) as exc:
+            last_exc = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, 0.5)
+    raise EmmaError(
+        "Codex app-server daemon started but never accepted a connection"
+    ) from last_exc
 
 
 def ask(prompt: str, *, timing: bool) -> None:
     started = time.monotonic()
     first_output_at: float | None = None
-    codex = find_codex()
 
-    with connect(codex) as server:
+    with connect() as server:
         connected_at = time.monotonic()
         thread_result = server.request(
             "thread/start",
