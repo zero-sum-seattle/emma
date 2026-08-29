@@ -18,14 +18,15 @@ small compatibility change.
 ## Install
 
 ```bash
-install -Dm755 emma ~/.local/bin/emma
+./install.sh
 ```
 
-Ensure `~/.local/bin` is on `PATH`. If an older zsh function named `emma` is
-still loaded in the current terminal, clear it once:
+This copies `emma` to `~/.local/bin/emma` and warns if that directory isn't on
+`PATH` or if `codex` isn't installed. Set `EMMA_INSTALL_PREFIX` to install
+somewhere else. If you'd rather install by hand:
 
 ```bash
-unfunction emma
+install -Dm755 emma ~/.local/bin/emma
 ```
 
 ## Usage
