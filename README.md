@@ -36,14 +36,63 @@ install -Dm755 emma ~/.local/bin/emma
 ## Usage
 
 ```bash
-emma how do I see disk usage
-emma what does chmod 755 mean
-emma --timing how do I list failed systemd services
-git log | emma what changed here
-emma -- --this-looks-like-a-flag-but-isnt
+emma "how do I see disk usage"
+emma "what does chmod 755 mean"
+emma --timing "how do I list failed systemd services"
+git log | emma "what changed here"
+emma -- "--this-looks-like-a-flag-but-isnt"
 emma --help
 emma --version
 ```
+
+Wrap questions in quotes to pass them as a single shell argument and prevent wildcard expansion or other unwanted shell interpretation. Double quotes still allow shell variable and command substitution; use single quotes when you want to preserve literal `# Emma
+
+<img src="assets/emma-mascot.png" alt="Emma mascot" width="240">
+
+Emma is a tiny terminal assistant built on top of the persistent Codex app-server.
+
+She connects to Codex's managed Unix socket, sends a focused question to gpt-5.6-luna, streams the answer straight back to your terminal, and then gets out of the way. The app-server keeps running, so Emma doesn't have to wake up an entirely new Codex process every time you ask something.
+
+Think of her as the AI coworker living in your terminal: quick to answer, low on ceremony, and always one command away.
+
+Emma is intentionally small and focused. She's great for quick questions, command help, explanations, sanity checks, and all the little things that don't need a full interactive Codex session.
+
+## Requirements
+
+- Linux with Python 3.10 or newer
+- Codex CLI 0.150.1 or a compatible release
+- An existing authenticated Codex login
+
+The app-server protocol is experimental. A future Codex update may require a
+small compatibility change.
+
+## Install
+
+```bash
+./install.sh
+```
+
+This copies `emma` to `~/.local/bin/emma` and warns if that directory isn't on
+`PATH` or if `codex` isn't installed. Set `EMMA_INSTALL_PREFIX` to install
+somewhere else. If you'd rather install by hand:
+
+```bash
+install -Dm755 emma ~/.local/bin/emma
+```
+
+## Usage
+
+```bash
+emma "how do I see disk usage"
+emma "what does chmod 755 mean"
+emma --timing "how do I list failed systemd services"
+git log | emma "what changed here"
+emma -- "--this-looks-like-a-flag-but-isnt"
+emma --help
+emma --version
+```
+
+ or backticks.
 
 Emma defaults to Luna with low reasoning. It starts Codex's managed daemon
 automatically when the socket is unavailable. Every question gets a fresh,
@@ -53,7 +102,7 @@ tools or access external services.
 The question can come from argv, from piped stdin, or both. If stdin is piped
 (a pipe or a redirected file — not just any non-terminal stdin) and argv is
 also given, the piped input is appended to the argv question as clearly
-delimited context, so `git log | emma what changed here` works as expected.
+delimited context, so `git log | emma "what changed here"` works as expected.
 Use `--` to stop option parsing so a question can start with a dash. `--help`
 and `--version` are handled directly and never touch the network or socket.
 
